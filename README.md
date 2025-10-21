@@ -2,7 +2,7 @@
 
 This repository contains the implementation and resources for the research paper:
 
-"Development of clinician-level multimodal automated seizure detection and type classification using synchronized video-electroencephalogram data"T
+"Development of clinician-level multimodal automated seizure detection and type classification using synchronized video-electroencephalogram data"
 
 # model
 The model definition is located in model.py. 
