@@ -9,7 +9,5 @@ The model definition is located in model.py.
 It implements a multimodal architecture that integrates EEG signals and 
 video data to predict seizure occurrence and classify seizure types.
 
-
-# eval
-
-Coming soon.
+# Training and Evaluation
+Documentation for training and evaluation procedures will be available soon.
