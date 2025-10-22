@@ -13,8 +13,14 @@ import torch
 import torch.nn as nn
 import math
 import torch.nn.functional as F
-from lib.core.base_trainer.rope_embedding import RotaryEmbedding
-from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
+from rope_embedding import RotaryEmbedding
+
+# use flash attn
+try:
+    from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
+    USE_FLASH_ATTN = True
+except:
+    USE_FLASH_ATTN=False
 
 torch._dynamo.config.cache_size_limit = 16
 class ImageModel(nn.Module):
@@ -34,25 +40,19 @@ class ImageModel(nn.Module):
                                   pretrained=True, )
 
         # modified
-        # self.net.blocks[0].conv.conv_xy.stride=[2,1,1]
+
         self.net.blocks[5] = nn.Identity()
-        # we use it as seq
-        # self.net.blocks[5].pool.pool = nn.AdaptiveMaxPool3d(1)
-        # self.net.blocks[5].dropout = nn.Identity()
-        # self.net.blocks[5].proj = nn.Identity()
-        # self.net.blocks[5].activation = nn.Identity()
-        # self.net.blocks[5].output_pool = nn.Identity()
         self.post_conv = nn.Sequential(nn.Conv3d(in_channels=192,
                                                  out_channels=512,
                                                  kernel_size=3,
                                                  padding=0,
                                                  stride=3, ))
-        # print(self.net)
+
 
     def forward(self, x):
         x = x / 255.
         # use a pre conv to reduce cost
-        # x = self.pre_conv(x)
+        x = self.pre_conv(x)
         x = self.net(x)
         x = self.post_conv(x)
         x = torch.flatten(x, start_dim=2)
@@ -71,10 +71,9 @@ class EEGModel(nn.Module):
                                        features_only=True
                                        )
 
-    def forward(self, x, image=None, targets=None):
+    def forward(self, x):
         bs = x.size(0)
 
-        # x shape is (bs, 2, 19,1000)
         x = x.view(bs, 1, 19, 2000) / 32.
         reshaped_tensor = x.view(bs, 1, 19, 250, 8)
         reshaped_and_permuted_tensor = reshaped_tensor.permute(0, 1, 2, 4, 3)
@@ -110,17 +109,15 @@ class MLP(nn.Module):
         return self.proj_drop(output)  # 在最终输出前应用dropout
 
     def init_weights(self):
-        """初始化MLP权重 - 使用类似GPT的初始化策略"""
-        std = 0.02  # 标准的transformer初始化标准差
 
-        # 使用正态分布初始化
+        std = 0.02
+
         nn.init.trunc_normal_(self.gate_proj.weight, mean=0.0, std=std)
         nn.init.trunc_normal_(self.up_proj.weight, mean=0.0, std=std)
 
-        # down_proj使用较小的标准差，因为它是residual path的一部分
         nn.init.trunc_normal_(self.down_proj.weight, mean=0.0, std=std / math.sqrt(2))
 
-        # 如果有bias，初始化为0
+        # bias==0
         if self.gate_proj.bias is not None:
             nn.init.zeros_(self.gate_proj.bias)
         if self.up_proj.bias is not None:
@@ -131,13 +128,9 @@ class MLP(nn.Module):
 
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
-        """
-        LlamaRMSNorm is equivalent to T5LayerNorm
-        """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-
         self.init_weights()
 
     def forward(self, hidden_states):
@@ -151,9 +144,7 @@ class RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
     def init_weights(self):
-        """初始化RMSNorm权重"""
-        nn.init.ones_(self.weight)  # 初始化为1
-
+        nn.init.ones_(self.weight)
 
 class RoPEAttention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
@@ -173,35 +164,32 @@ class RoPEAttention(nn.Module):
 
         self.init_weights()
 
-        self.flash = True
 
     def forward(self, x):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)  # [B, num_heads, N, head_dim]
         with torch.cuda.amp.autocast(enabled=False):
-            # 应用RoPE到q和k
+            # RoPE q和k
             q = self.rope.rotate_queries_or_keys(q)
             k = self.rope.rotate_queries_or_keys(k)
 
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        # 计算注意力
-        # 计算注意力
-        if self.flash:
-            # Flash Attention需要的输入格式: [B, N, num_heads, head_dim]
+        # attention
+        if USE_FLASH_ATTN:
+            # Flash Attention input: [B, N, num_heads, head_dim]
             q = q.transpose(1, 2)  # [B, N, num_heads, head_dim]
             k = k.transpose(1, 2)  # [B, N, num_heads, head_dim]
             v = v.transpose(1, 2)  # [B, N, num_heads, head_dim]
 
-            # 使用Flash Attention
-            x = flash_attn_func(q, k, v)  # 输出: [B, N, num_heads, head_dim]
+            # Flash Attention
+            x = flash_attn_func(q, k, v)  # ouput: [B, N, num_heads, head_dim]
 
-            # 重塑回原始维度
             x = x.reshape(B, N, C)
         else:
-            # 标准注意力机制
+            # attention
             attn = (q @ k.transpose(-2, -1)) * self.scale
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
@@ -212,23 +200,18 @@ class RoPEAttention(nn.Module):
         return x
 
     def init_weights(self):
-        """初始化注意力权重"""
         std = 0.02
 
-        # QKV权重初始化
         nn.init.trunc_normal_(self.qkv.weight, mean=0.0, std=std)
         if self.qkv.bias is not None:
             nn.init.zeros_(self.qkv.bias)
 
-        # 输出投影权重初始化 - 使用较小的std因为是residual path
         nn.init.trunc_normal_(self.proj.weight, mean=0.0, std=std / math.sqrt(2))
         if self.proj.bias is not None:
             nn.init.zeros_(self.proj.bias)
 
 
 class DropPath(nn.Module):
-    """Drop paths (Stochastic Depth) per sample when applied in main path of residual blocks."""
-
     def __init__(self, drop_prob=None):
         super(DropPath, self).__init__()
         self.drop_prob = drop_prob
@@ -339,20 +322,19 @@ class Net(nn.Module):
         self.init_weights()
 
     def init_weights(self):
-        """初始化整个网络的权重"""
+
         std = 0.02
 
-        # 初始化class embedding
+        # class embedding
         nn.init.trunc_normal_(self.class_embedding, mean=0.0, std=std)
 
-        # 初始化特征投影层
+
         nn.init.trunc_normal_(self.image_feature_proj.weight, mean=0.0, std=std)
         nn.init.zeros_(self.image_feature_proj.bias)
 
         nn.init.trunc_normal_(self.eeg_feature_proj.weight, mean=0.0, std=std)
         nn.init.zeros_(self.eeg_feature_proj.bias)
 
-        # 初始化最终的分类头
         nn.init.trunc_normal_(self.task1.weight, mean=0.0, std=std)
         nn.init.zeros_(self.task1.bias)
         nn.init.trunc_normal_(self.task2.weight, mean=0.0, std=std)
@@ -364,18 +346,17 @@ class Net(nn.Module):
         batch_size = x.size(0)
         class_embeds = self.class_embedding.expand(batch_size, 1, -1)
         embeddings = torch.cat([class_embeds, x], dim=1)
-        # 移除position embedding，因为RoPE会在attention中处理位置信息
-        # embeddings = embeddings + self.position_embedding(self.position_ids)
+
         return embeddings
 
-    @torch.compile
-    def forward(self, waves, images=0, targets=None):
+    # @torch.compile
+    def forward(self, waves, images=None, targets=None):
         bs = waves.size(0)
 
         x_eeg = self.eeg_model(waves)
         x_eeg = self.eeg_feature_proj(x_eeg)
 
-        if images!=0:
+        if images!=None:
             # project image and eeg feature
             x_image = self.image_model(images)
             x_image = self.image_feature_proj(x_image)
@@ -405,15 +386,14 @@ class Net(nn.Module):
 
     def criterion(self, preds, targets):
 
+        # drop the targets ==-1
         valid_mask = (targets != -1)
         preds = preds[valid_mask]
         targets = targets[valid_mask]
         if not valid_mask.any():
-            # 如果没有有效目标，返回0损失或跳过这个batch
             return torch.tensor(0.0, requires_grad=True, device=preds.device)
-        # ignore_index=-1 表示忽略掉 -1 这个类别的预测结果，因为我们只关心前两个类别的预测结果。
+        # ignore_index=-1
         loss = torch.nn.functional.cross_entropy(preds, targets, ignore_index=-1)
-        # loss = F.nll_loss(torch.log(preds), targets)
         return loss
 
     def head(self, logits, targets):
