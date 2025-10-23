@@ -12,3 +12,12 @@ video data to predict seizure occurrence and classify seizure types.
 
 # Training and Evaluation
 Documentation for training and evaluation procedures will be available soon.
+
+# Demo & Inference
+
+```
+modified the CONFIG in demo.py and
+
+python demo.py
+
+```
